@@ -1475,3 +1475,67 @@ fn absences(sc: &Scan) -> Vec<Finding> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unbounded_scan_flags_widthless_conversions() {
+        assert!(unbounded_scan("%s"));
+        assert!(unbounded_scan("%[abc]"));
+        assert!(unbounded_scan("%d %s"));
+    }
+
+    #[test]
+    fn unbounded_scan_respects_field_width() {
+        assert!(!unbounded_scan("%10s"));
+        assert!(!unbounded_scan("%31[^\n]"));
+    }
+
+    #[test]
+    fn unbounded_scan_ignores_literal_percent() {
+        assert!(!unbounded_scan("%%s"));
+        assert!(!unbounded_scan("hello world"));
+    }
+
+    #[test]
+    fn unbounded_scan_treats_suppressed_star_as_unbounded() {
+        // %*s discards input into no buffer, yet the parser still flags it.
+        assert!(unbounded_scan("%*s"));
+    }
+
+    #[test]
+    fn looks_shell_detects_command_templates() {
+        assert!(looks_shell("cp %s /tmp"));
+        assert!(looks_shell("ping %s"));
+    }
+
+    #[test]
+    fn looks_shell_ignores_benign_formats() {
+        assert!(!looks_shell("value=%d"));
+        assert!(!looks_shell("hello"));
+    }
+
+    #[test]
+    fn is_neutered_matches_all_ones() {
+        assert!(is_neutered(u64::MAX));
+        assert!(is_neutered(0xffff_ffff));
+        assert!(!is_neutered(0));
+        assert!(!is_neutered(0x10));
+    }
+
+    #[test]
+    fn stack_off_formats_sign() {
+        assert_eq!(stack_off(-16), "sp-0x10");
+        assert_eq!(stack_off(32), "sp+0x20");
+    }
+
+    #[test]
+    fn mode_note_precedence() {
+        assert_eq!(mode_note(0o4755), Some("setuid bit in mode 0o4755".to_string()));
+        assert_eq!(mode_note(0o2755), Some("setgid bit in mode 0o2755".to_string()));
+        assert_eq!(mode_note(0o0666), Some("world-writable mode 0o666".to_string()));
+        assert_eq!(mode_note(0o0755), None);
+    }
+}
