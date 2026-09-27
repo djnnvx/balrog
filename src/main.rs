@@ -160,11 +160,14 @@ fn scan_and_filter(
 fn dedup_templates(findings: &mut Vec<rules::Finding>) {
     let mut seen = HashSet::new();
     findings.retain(|finding| {
-        let template = finding
+        let Some(template) = finding
             .evidence
             .iter()
             .find(|line| line.starts_with("format ") || line.starts_with("command template"))
-            .cloned();
+            .cloned()
+        else {
+            return true;
+        };
         seen.insert((
             finding.bin.clone(),
             finding.risky_call.clone(),
