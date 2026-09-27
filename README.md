@@ -31,6 +31,7 @@ balrog scan -j <path>          JSON
 balrog scan --class exec <p>   one class only
 balrog scan --min 100 <p>      score floor
 balrog scan --per-bin 2 <p>    cap findings per class per binary
+balrog scan --top 30 <p>       cap findings shown per class (default 15)
 balrog imports <file>          resolved imports and their stub addresses
 ```
 
