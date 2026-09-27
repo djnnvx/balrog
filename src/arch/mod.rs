@@ -5,7 +5,7 @@ pub mod mips;
 use crate::load::Binary;
 use anyhow::Result;
 use capstone::arch::arm::ArmOperandType;
-use capstone::arch::arm64::Arm64OperandType;
+use capstone::arch::arm64::{Arm64OperandType, Arm64Shift};
 use capstone::arch::mips::MipsOperand;
 use capstone::arch::ArchOperand;
 use capstone::prelude::*;
@@ -162,7 +162,10 @@ fn operands(ops: &[ArchOperand]) -> [Op; 3] {
         },
         Some(ArchOperand::Arm64Operand(o)) => match o.op_type {
             Arm64OperandType::Reg(r) => Op::Reg(r.0),
-            Arm64OperandType::Imm(v) => Op::Imm(v),
+            Arm64OperandType::Imm(v) => match o.shift {
+                Arm64Shift::Lsl(n) => Op::Imm(v << n),
+                _ => Op::Imm(v),
+            },
             Arm64OperandType::Mem(m) => Op::Mem(m.base().0, m.disp() as i64),
             _ => Op::None,
         },
@@ -277,4 +280,74 @@ pub fn resolve_stubs(bin: &Binary, insns: &[Ins]) -> HashMap<u64, String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+
+    fn dummy(arch: Arch, little: bool) -> Binary {
+        Binary {
+            path: PathBuf::new(),
+            data: vec![],
+            arch,
+            little,
+            entry: 0,
+            segs: vec![],
+            got2sym: HashMap::new(),
+            undef_stub: vec![],
+            imports: HashSet::new(),
+            exports: vec![],
+            locals: vec![],
+            gp: None,
+        }
+    }
+
+    fn decode_one(arch: Arch, bytes: &[u8], addr: u64, want_mnem: &str) -> Kind {
+        let bin = dummy(arch, true);
+        let cs = build(arch, true).unwrap();
+        let insns = cs.disasm_count(bytes, addr, 1).unwrap();
+        let insn = insns.iter().next().expect("no instruction decoded");
+        assert_eq!(insn.mnemonic(), Some(want_mnem));
+        classify(&cs, &bin, insn).expect("classify returned None")
+    }
+
+    #[test]
+    fn aarch64_add_lsl12_scales_imm() {
+        let k = decode_one(Arch::Aarch64, &[0xbe, 0x07, 0x40, 0x11], 0, "add");
+        match k {
+            Kind::AddImm { imm, .. } => assert_eq!(imm, 0x1000),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aarch64_mov_imm_recovers_const() {
+        let k = decode_one(Arch::Aarch64, &[0xe1, 0xff, 0x9f, 0x52], 0, "mov");
+        match k {
+            Kind::SetConst { val, .. } => assert_eq!(val, 0xffff),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arm_mov_imm_recovers_const() {
+        let k = decode_one(Arch::Arm, &[0x07, 0x30, 0xa0, 0xe3], 0, "mov");
+        match k {
+            Kind::SetConst { val, .. } => assert_eq!(val, 7),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arm_sub_pc_is_pc_resolved() {
+        let addr = 0u64;
+        let k = decode_one(Arch::Arm, &[0x04, 0x00, 0x4f, 0xe2], addr, "sub");
+        match k {
+            Kind::SetConst { val, .. } => assert_eq!(val, addr + 8 - 4),
+            other => panic!("got {other:?}"),
+        }
+    }
 }

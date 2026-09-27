@@ -91,6 +91,7 @@ pub const SHELL: &[&str] = &[
     "ugs_execRoot_shell",
     "prctl_runCommandInShellWithTimeout",
     "safe_popen",
+    "qid_sys_execute_update_script",
 ];
 pub const SHELL_ARG1: &[&str] = &["SLIBCExecl"];
 pub const EVAL: &[&str] = &[
@@ -554,14 +555,15 @@ fn unbounded_scan(fmt: &str) -> bool {
             i = j + 1;
             continue;
         }
-        if j < chars.len() && chars[j] == '*' {
+        let suppressed = j < chars.len() && chars[j] == '*';
+        if suppressed {
             j += 1;
         }
         let had_width = j < chars.len() && chars[j].is_ascii_digit();
         while j < chars.len() && chars[j].is_ascii_digit() {
             j += 1;
         }
-        if j < chars.len() && (chars[j] == 's' || chars[j] == '[') && !had_width {
+        if j < chars.len() && (chars[j] == 's' || chars[j] == '[') && !had_width && !suppressed {
             return true;
         }
         i = j + 1;
@@ -650,11 +652,7 @@ fn socket_paths(g: &Graph) -> Vec<String> {
 }
 
 fn is_exec_primitive(import: &str) -> bool {
-    SHELL.contains(&import)
-        || PRINTF_EXEC.contains(&import)
-        || ARGV_EXEC.contains(&import)
-        || import.contains("exec")
-        || import.contains("system_cmd")
+    SHELL.contains(&import) || PRINTF_EXEC.contains(&import) || ARGV_EXEC.contains(&import)
 }
 
 fn exec_imports(bin: &Binary) -> Vec<&str> {
@@ -687,7 +685,7 @@ impl<'a> Scan<'a> {
         Scan {
             bin,
             graph,
-            name: bin.name(),
+            name: bin.path.to_string_lossy().into_owned(),
             reach: graph.reach_from(UNTRUSTED_INPUTS),
             wrappers: graph.shell_equivalent(&seeds),
             calls: call_index(graph),
@@ -941,7 +939,8 @@ fn sized_write(s: &Site, len: usize) -> Option<Hit> {
         return Some(h);
     }
     let fortify_disabled = fortify_bound(s).is_some_and(is_neutered);
-    let stack_dest = s.stack(0);
+    let dest = if s.imp == "bcopy" { 1 } else { 0 };
+    let stack_dest = s.stack(dest);
     let measures_reachable_input = measures_input(s) && s.reach == Some(0);
     let suspicious = stack_dest.is_some() || fortify_disabled || measures_reachable_input;
     if !s.unknown(len) || !suspicious {
@@ -1131,7 +1130,7 @@ fn unix_listener(s: &Site) -> Option<Hit> {
     for p in s.scan.unix_paths.iter().take(MAX_SOCKET_PATHS) {
         h.note(format!("socket path {p:?}"));
     }
-    if s.scan.no_peercred {
+    if s.scan.no_peercred && !s.scan.unix_paths.is_empty() {
         h.bump(30, "no SO_PEERCRED / getpeereid anywhere in this binary");
     }
     let execs = &s.scan.exec_imports;
@@ -1500,9 +1499,9 @@ mod tests {
     }
 
     #[test]
-    fn unbounded_scan_treats_suppressed_star_as_unbounded() {
-        // %*s discards input into no buffer, yet the parser still flags it.
-        assert!(unbounded_scan("%*s"));
+    fn unbounded_scan_ignores_suppressed_star() {
+        assert!(!unbounded_scan("%*s"));
+        assert!(!unbounded_scan("%*[^\n]"));
     }
 
     #[test]
@@ -1537,5 +1536,87 @@ mod tests {
         assert_eq!(mode_note(0o2755), Some("setgid bit in mode 0o2755".to_string()));
         assert_eq!(mode_note(0o0666), Some("world-writable mode 0o666".to_string()));
         assert_eq!(mode_note(0o0755), None);
+    }
+
+    fn bin(arch: crate::arch::Arch, imports: &[&str]) -> Binary {
+        Binary {
+            path: "/rootfs/bin/foo".into(),
+            data: vec![],
+            arch,
+            little: true,
+            entry: 0,
+            segs: vec![],
+            got2sym: HashMap::new(),
+            undef_stub: vec![],
+            imports: imports.iter().map(|s| s.to_string()).collect(),
+            exports: vec![],
+            locals: vec![],
+            gp: None,
+        }
+    }
+
+    fn graph(sites: Vec<CallSite>, strings: HashMap<u64, Vec<String>>) -> Graph {
+        Graph {
+            names: HashMap::new(),
+            sites,
+            edges: HashMap::new(),
+            strings,
+            addr_taken: HashSet::new(),
+        }
+    }
+
+    fn site(import: &str, args: Vec<Option<Val>>) -> CallSite {
+        CallSite { site: 0x1000, func: 0, import: Some(import.into()), target: 0, args }
+    }
+
+    #[test]
+    fn is_exec_primitive_rejects_substrings() {
+        assert!(!is_exec_primitive("regexec"));
+        assert!(!is_exec_primitive("sqlite3_exec"));
+        assert!(!is_exec_primitive("pcre_exec"));
+        assert!(is_exec_primitive("system"));
+        assert!(is_exec_primitive("qid_sys_execute_update_script"));
+    }
+
+    #[test]
+    fn finding_bin_carries_full_path_not_basename() {
+        let b = bin(crate::arch::Arch::Aarch64, &[]);
+        let g = graph(vec![site("system", vec![None])], HashMap::new());
+        let findings = analyze(&b, &g);
+        assert!(findings.iter().any(|f| f.bin == "/rootfs/bin/foo"));
+        assert!(!findings.iter().any(|f| f.bin == "foo"));
+    }
+
+    #[test]
+    fn bind_tcp_without_socket_evidence_omits_peercred_bonus() {
+        let b = bin(crate::arch::Arch::Aarch64, &[]);
+        let g = graph(vec![site("bind", vec![])], HashMap::new());
+        let findings = analyze(&b, &g);
+        assert!(!findings
+            .iter()
+            .any(|f| f.evidence.iter().any(|e| e.contains("no SO_PEERCRED"))));
+    }
+
+    #[test]
+    fn bind_unix_socket_fires_peercred_bonus() {
+        let b = bin(crate::arch::Arch::Aarch64, &[]);
+        let mut strings = HashMap::new();
+        strings.insert(0x1000u64, vec!["/tmp/foo.sock".to_string()]);
+        let g = graph(vec![site("bind", vec![])], strings);
+        let findings = analyze(&b, &g);
+        assert!(findings
+            .iter()
+            .any(|f| f.evidence.iter().any(|e| e.contains("no SO_PEERCRED"))));
+    }
+
+    #[test]
+    fn bcopy_destination_is_arg1() {
+        let b = bin(crate::arch::Arch::Aarch64, &[]);
+        let args = vec![None, Some(Val::Stack(-0x10)), None];
+        let g = graph(vec![site("bcopy", args)], HashMap::new());
+        let findings = analyze(&b, &g);
+        assert!(findings
+            .iter()
+            .any(|f| f.evidence.iter().any(|e| e.contains("stack buffer"))));
     }
 }

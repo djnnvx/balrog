@@ -78,15 +78,31 @@ pub fn decode(mnemonic: &str, o: &[Op; 3], addr: u64, bin: &Binary) -> Option<Ki
                 })
             }
         }
-        "sub" => Some(Kind::AddImm {
-            dst: reg(o, 0)?,
-            base: reg(o, 1)?,
-            imm: -imm(o, 2)?,
-        }),
-        "mov" => Some(Kind::Mov {
-            dst: reg(o, 0)?,
-            src: reg(o, 1)?,
-        }),
+        "sub" => {
+            let (dst, base) = (reg(o, 0)?, reg(o, 1)?);
+            if base == ArmReg::ARM_REG_PC as u16 {
+                Some(Kind::SetConst {
+                    dst,
+                    val: pc_relative(addr, -imm(o, 2)?),
+                })
+            } else {
+                Some(Kind::AddImm {
+                    dst,
+                    base,
+                    imm: -imm(o, 2)?,
+                })
+            }
+        }
+        "mov" => match o[1] {
+            Op::Imm(val) => Some(Kind::SetConst {
+                dst: reg(o, 0)?,
+                val: val as u64,
+            }),
+            _ => Some(Kind::Mov {
+                dst: reg(o, 0)?,
+                src: reg(o, 1)?,
+            }),
+        },
         _ => None,
     }
 }

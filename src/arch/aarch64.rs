@@ -41,10 +41,16 @@ pub fn decode(mnemonic: &str, o: &[Op; 3]) -> Option<Kind> {
             base: reg(o, 1)?,
             imm: -imm(o, 2)?,
         }),
-        "mov" => Some(Kind::Mov {
-            dst: reg(o, 0)?,
-            src: reg(o, 1)?,
-        }),
+        "mov" => match o[1] {
+            Op::Imm(val) => Some(Kind::SetConst {
+                dst: reg(o, 0)?,
+                val: val as u64,
+            }),
+            _ => Some(Kind::Mov {
+                dst: reg(o, 0)?,
+                src: reg(o, 1)?,
+            }),
+        },
         _ => None,
     }
 }
