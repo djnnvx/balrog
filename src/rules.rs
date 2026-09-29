@@ -14,6 +14,7 @@ pub enum Class {
     Auth,
     Priv,
     Path,
+    Wdt,
 }
 
 pub const ORDER: &[Class] = &[
@@ -25,6 +26,7 @@ pub const ORDER: &[Class] = &[
     Class::Auth,
     Class::Priv,
     Class::Path,
+    Class::Wdt,
 ];
 
 impl Class {
@@ -38,6 +40,7 @@ impl Class {
             Class::Auth => 30,
             Class::Priv => 30,
             Class::Path => 20,
+            Class::Wdt => 25,
         }
     }
     pub fn tag(self) -> &'static str {
@@ -50,6 +53,7 @@ impl Class {
             Class::Auth => "auth",
             Class::Priv => "priv",
             Class::Path => "path",
+            Class::Wdt => "wdt",
         }
     }
 }
@@ -413,6 +417,12 @@ const CURL_VERIFY_OPTS: &[(u64, &str)] = &[
     (249, "CURLOPT_PROXY_SSL_VERIFYHOST"),
 ];
 const WRDE_NOCMD: u64 = 4;
+const WDIOC_SETOPTIONS: u64 = 0x8004_5704;
+const WDIOC_SETOPTIONS_MIPS: u64 = 0x4004_5704;
+const WDIOC_SETTIMEOUT: u64 = 0xc004_5706;
+const LENGTH_NOT_WRITTEN: &[&str] = &["snprintf", "vsnprintf", "strlcpy", "strlcat"];
+const BOUNDS_LENGTH: &[&str] = &["strnlen", "wcsnlen"];
+const BOUND_NAMES: &[&str] = &["clamp", "bound", "limit", "min"];
 const MBEDTLS_VERIFY_NONE: u64 = 0;
 const MBEDTLS_VERIFY_OPTIONAL: u64 = 1;
 const PROT_WRITE_EXEC: u64 = 0o6;
@@ -748,7 +758,24 @@ impl Site<'_> {
         }
     }
     fn unknown(&self, n: usize) -> bool {
-        self.call.args.get(n).map(Option::is_none).unwrap_or(false)
+        matches!(self.call.args.get(n), Some(None | Some(Val::Ret(_))))
+    }
+    fn source(&self, n: usize) -> Option<&str> {
+        let Some(Some(Val::Ret(i))) = self.call.args.get(n) else {
+            return None;
+        };
+        let producer = self.scan.graph.sites.get(*i)?;
+        producer.import.as_deref().or_else(|| {
+            self.scan
+                .graph
+                .names
+                .get(&producer.target)
+                .map(String::as_str)
+        })
+    }
+    fn tainted(&self, n: usize) -> bool {
+        self.source(n)
+            .is_some_and(|f| UNTRUSTED_INPUTS.contains(&f))
     }
     fn visible(&self, n: usize) -> bool {
         n < self.call.args.len()
@@ -962,7 +989,8 @@ fn sized_write(s: &Site, len: usize) -> Option<Hit> {
     let dest = if s.imp == "bcopy" { 1 } else { 0 };
     let stack_dest = s.stack(dest);
     let measures_reachable_input = measures_input(s) && s.reach == Some(0);
-    let suspicious = stack_dest.is_some() || fortify_disabled || measures_reachable_input;
+    let suspicious =
+        stack_dest.is_some() || fortify_disabled || measures_reachable_input || s.tainted(len);
     if !s.unknown(len) || !suspicious {
         return None;
     }
@@ -1223,8 +1251,62 @@ fn classify(s: &Site) -> Option<Hit> {
         temp_file(s)
     } else if imp == "bind" {
         unix_listener(s)
+    } else if imp == "ioctl" {
+        watchdog_ioctl(s)
+    } else if imp == "write" {
+        watchdog_magic_close(s)
     } else {
         None
+    }
+}
+
+fn watchdog_ioctl(s: &Site) -> Option<Hit> {
+    let setoptions = match s.scan.bin.arch {
+        crate::arch::Arch::Mips => WDIOC_SETOPTIONS_MIPS,
+        _ => WDIOC_SETOPTIONS,
+    };
+    let (adjust, why) = match s.num(1)? {
+        n if n == setoptions => (
+            15,
+            "WDIOC_SETOPTIONS: WDIOS_DISABLECARD disarms the watchdog",
+        ),
+        WDIOC_SETTIMEOUT => (5, "WDIOC_SETTIMEOUT: a huge timeout is a disarmed watchdog"),
+        _ => return None,
+    };
+    let mut h = Hit::new(Class::Wdt, adjust);
+    h.note(why);
+    Some(h)
+}
+
+fn watchdog_magic_close(s: &Site) -> Option<Hit> {
+    if s.text(1).as_deref() != Some("V") {
+        return None;
+    }
+    let mut h = Hit::new(Class::Wdt, 10);
+    h.note("magic close: writing 'V' disarms the watchdog when this fd closes (unless nowayout)");
+    Some(h)
+}
+
+fn is_bound_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    BOUND_NAMES.iter().any(|k| name.contains(k))
+}
+
+fn note_provenance(s: &Site, h: &mut Hit) {
+    for n in 0..s.call.args.len() {
+        let Some(src) = s.source(n) else { continue };
+        if UNTRUSTED_INPUTS.contains(&src) {
+            h.bump(15, format!("arg {n} is the raw return of {src}()"));
+        } else if LENGTH_NOT_WRITTEN.contains(&src) {
+            h.bump(
+                15,
+                format!(
+                    "arg {n} is the return of {src}(): the untruncated length, not bytes written"
+                ),
+            );
+        } else if BOUNDS_LENGTH.contains(&src) || is_bound_name(src) {
+            h.bump(-20, format!("arg {n} is bounded by {src}()"));
+        }
     }
 }
 
@@ -1313,6 +1395,7 @@ fn adjust(s: &Site, h: &mut Hit) {
     note_sanitizers(s, h);
     note_function_strings(s, h);
     note_cgi_variable(s, h);
+    note_provenance(s, h);
     if s.scan.wrappers.contains(&s.call.func) && h.class != Class::Exec {
         h.bump(10, "inside a shell-equivalent wrapper");
     }
@@ -1599,7 +1682,13 @@ mod tests {
     }
 
     fn site(import: &str, args: Vec<Option<Val>>) -> CallSite {
-        CallSite { site: 0x1000, func: 0, import: Some(import.into()), target: 0, args }
+        CallSite {
+            site: 0x1000,
+            func: 0,
+            import: Some(import.into()),
+            target: 0,
+            args,
+        }
     }
 
     #[test]
@@ -1627,7 +1716,7 @@ mod tests {
         let findings = analyze(&b, &g);
         assert!(!findings
             .iter()
-            .any(|f| f.evidence.iter().any(|e| e.contains("no SO_PEERCRED"))));
+            .any(|f| f.evidence.iter().any(|e| e.text.contains("no SO_PEERCRED"))));
     }
 
     #[test]
@@ -1639,7 +1728,7 @@ mod tests {
         let findings = analyze(&b, &g);
         assert!(findings
             .iter()
-            .any(|f| f.evidence.iter().any(|e| e.contains("no SO_PEERCRED"))));
+            .any(|f| f.evidence.iter().any(|e| e.text.contains("no SO_PEERCRED"))));
     }
 
     #[test]

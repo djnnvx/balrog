@@ -19,6 +19,7 @@ pub const ARG_REGS: [u16; 4] = [
 
 pub const SP: u16 = MipsReg::MIPS_REG_SP as u16;
 pub const GP: u16 = MipsReg::MIPS_REG_GP as u16;
+pub const V0: u16 = MipsReg::MIPS_REG_V0 as u16;
 
 pub fn decode(mnemonic: &str, o: &[Op; 3]) -> Option<Kind> {
     match mnemonic {

@@ -115,7 +115,8 @@ pub fn sweep(cs: &Capstone, bin: &Binary) -> Vec<Ins> {
         let mut pos: u64 = 0;
         let len = (end - start) as u64;
         while pos < len {
-            let Ok(insns) = cs.disasm_all(&code[pos as usize..], seg.vaddr + pos) else {
+            let Ok(insns) = cs.disasm_count(&code[pos as usize..], seg.vaddr + pos, SWEEP_CHUNK)
+            else {
                 pos += align;
                 continue;
             };
@@ -219,6 +220,13 @@ fn arg_regs(arch: Arch) -> &'static [u16] {
 
 pub fn arg_reg(arch: Arch, n: usize) -> Option<u16> {
     arg_regs(arch).get(n).copied()
+}
+
+pub fn ret_reg(arch: Arch) -> Option<u16> {
+    match arch {
+        Arch::Mips => Some(mips::V0),
+        _ => arg_reg(arch, 0),
+    }
 }
 
 pub fn arg_count(arch: Arch) -> usize {

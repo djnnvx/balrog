@@ -8,6 +8,7 @@ pub enum Val {
     Num(u64),
     Stack(i64),
     Import(u64),
+    Ret(usize),
 }
 
 pub struct CallSite {
@@ -156,6 +157,12 @@ impl<'a> Regs<'a> {
         }
     }
 
+    fn returned(&mut self, site: Option<usize>) {
+        if let Some(r) = arch::ret_reg(self.bin.arch) {
+            self.set(r, site.map(Val::Ret));
+        }
+    }
+
     fn clobber_args(&mut self) {
         for n in 0..self.nargs {
             if let Some(r) = arch::arg_reg(self.bin.arch, n) {
@@ -222,8 +229,10 @@ impl Graph {
                         args: regs.args(),
                     });
                     regs.clobber_args();
+                    regs.returned(Some(g.sites.len() - 1));
                 }
                 Kind::CallInd { reg } => {
+                    let mut pushed = None;
                     if let Some(name) = regs.import_at(reg).cloned() {
                         g.sites.push(CallSite {
                             site: ins.addr,
@@ -232,9 +241,15 @@ impl Graph {
                             target: 0,
                             args: regs.args(),
                         });
+                        pushed = Some(g.sites.len() - 1);
                     }
                     regs.clobber_args();
+                    regs.returned(pushed);
                 }
+                // A return ends the frame. Reset here so a callee-saved value
+                // (notably Val::Ret) cannot bleed into a following function that
+                // was not detected as a start and so never triggers enter().
+                Kind::Ret => regs.enter(),
                 _ => {}
             }
             if let Some(Val::Num(value)) = wrote {
@@ -299,5 +314,72 @@ impl Graph {
             }
         }
         tainted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::{arg_reg, Arch, Ins, Kind};
+
+    fn empty_bin() -> Binary {
+        Binary {
+            path: "/t".into(),
+            data: vec![],
+            arch: Arch::Aarch64,
+            little: true,
+            entry: 0,
+            segs: vec![],
+            got2sym: HashMap::new(),
+            undef_stub: vec![],
+            imports: HashSet::new(),
+            exports: vec![],
+            locals: vec![],
+            gp: None,
+        }
+    }
+
+    // Func A (start 0) calls recv, returns, then an UNDETECTED func at 0x8 calls
+    // memcpy with the value in x0. Without the ret reset, x0=Ret(recv) bleeds
+    // across and memcpy's arg is tagged as recv's return.
+    fn stream() -> (Vec<Ins>, HashMap<u64, String>) {
+        let x0 = arg_reg(Arch::Aarch64, 0).unwrap();
+        let x2 = arg_reg(Arch::Aarch64, 2).unwrap();
+        let insns = vec![
+            Ins {
+                addr: 0x0,
+                kind: Kind::Call(0x100),
+            }, // recv -> x0 = Ret
+            Ins {
+                addr: 0x4,
+                kind: Kind::Ret,
+            },
+            Ins {
+                addr: 0x8,
+                kind: Kind::Mov { dst: x2, src: x0 },
+            },
+            Ins {
+                addr: 0xc,
+                kind: Kind::Call(0x200),
+            }, // memcpy(_, _, x2)
+        ];
+        let stubs = HashMap::from([(0x100, "recv".to_string()), (0x200, "memcpy".to_string())]);
+        (insns, stubs)
+    }
+
+    #[test]
+    fn ret_stops_cross_function_ret_leak() {
+        let (insns, stubs) = stream();
+        let g = Graph::build(&empty_bin(), &insns, stubs);
+        let memcpy = g
+            .sites
+            .iter()
+            .find(|s| s.import.as_deref() == Some("memcpy"))
+            .unwrap();
+        assert_eq!(
+            memcpy.args.get(2),
+            Some(&None),
+            "recv return leaked across ret into memcpy"
+        );
     }
 }
