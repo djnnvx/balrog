@@ -497,8 +497,23 @@ pub struct Finding {
     pub site: u64,
     pub func: String,
     pub reach: Option<u32>,
-    pub evidence: Vec<String>,
+    pub evidence: Vec<Evidence>,
     pub score: i32,
+}
+
+#[derive(Serialize)]
+pub struct Evidence {
+    pub points: i32,
+    pub text: String,
+}
+
+impl Evidence {
+    fn new(points: i32, text: impl Into<String>) -> Evidence {
+        Evidence {
+            points,
+            text: text.into(),
+        }
+    }
 }
 
 fn hex<S: serde::Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
@@ -586,23 +601,25 @@ fn mode_note(m: u64) -> Option<String> {
 struct Hit {
     class: Class,
     score: i32,
-    evidence: Vec<String>,
+    evidence: Vec<Evidence>,
 }
 
 impl Hit {
     fn new(class: Class, adjust: i32) -> Hit {
+        let score = class.base() + adjust;
+        let why = format!("{} base {}, rule {adjust:+}", class.tag(), class.base());
         Hit {
             class,
-            score: class.base() + adjust,
-            evidence: Vec::new(),
+            score,
+            evidence: vec![Evidence::new(score, why)],
         }
     }
     fn note(&mut self, ev: impl Into<String>) {
-        self.evidence.push(ev.into());
+        self.evidence.push(Evidence::new(0, ev));
     }
     fn bump(&mut self, delta: i32, ev: impl Into<String>) {
         self.score += delta;
-        self.evidence.push(ev.into());
+        self.evidence.push(Evidence::new(delta, ev));
     }
 }
 
@@ -787,7 +804,10 @@ fn shell(s: &Site) -> Option<Hit> {
         h.note(format!("command template {t:?}"));
     }
     if !templates.is_empty() {
-        h.score += SHELL_TEMPLATE_BONUS;
+        h.bump(
+            SHELL_TEMPLATE_BONUS,
+            "shell-looking strings in the same function",
+        );
     }
     Some(h)
 }
@@ -1138,7 +1158,7 @@ fn unix_listener(s: &Site) -> Option<Hit> {
         h.note(format!("exec reachable via {e}"));
     }
     if !execs.is_empty() {
-        h.score += 20;
+        h.bump(20, "this binary can exec");
     }
     if !s.scan.drops_privilege && !execs.is_empty() {
         h.bump(
@@ -1428,7 +1448,11 @@ fn absences(sc: &Scan) -> Vec<Finding> {
             site: 0,
             func: "(whole binary)".into(),
             reach: None,
-            evidence: ev.iter().map(|e| e.to_string()).collect(),
+            evidence: ev
+                .iter()
+                .enumerate()
+                .map(|(i, e)| Evidence::new(if i == 0 { score } else { 0 }, *e))
+                .collect(),
             score,
         })
     };
@@ -1532,9 +1556,18 @@ mod tests {
 
     #[test]
     fn mode_note_precedence() {
-        assert_eq!(mode_note(0o4755), Some("setuid bit in mode 0o4755".to_string()));
-        assert_eq!(mode_note(0o2755), Some("setgid bit in mode 0o2755".to_string()));
-        assert_eq!(mode_note(0o0666), Some("world-writable mode 0o666".to_string()));
+        assert_eq!(
+            mode_note(0o4755),
+            Some("setuid bit in mode 0o4755".to_string())
+        );
+        assert_eq!(
+            mode_note(0o2755),
+            Some("setgid bit in mode 0o2755".to_string())
+        );
+        assert_eq!(
+            mode_note(0o0666),
+            Some("world-writable mode 0o666".to_string())
+        );
         assert_eq!(mode_note(0o0755), None);
     }
 
@@ -1617,6 +1650,181 @@ mod tests {
         let findings = analyze(&b, &g);
         assert!(findings
             .iter()
-            .any(|f| f.evidence.iter().any(|e| e.contains("stack buffer"))));
+            .any(|f| f.evidence.iter().any(|e| e.text.contains("stack buffer"))));
+    }
+
+    fn at(import: &str, site: u64, args: Vec<Option<Val>>) -> CallSite {
+        CallSite {
+            site,
+            func: 0,
+            import: Some(import.into()),
+            target: 0,
+            args,
+        }
+    }
+
+    fn scan(b: &Binary, sites: Vec<CallSite>, sink: &str) -> Vec<Finding> {
+        let g = graph(sites, HashMap::new());
+        analyze(b, &g)
+            .into_iter()
+            .filter(|f| f.risky_call == sink)
+            .collect()
+    }
+
+    fn says(f: &Finding, text: &str) -> bool {
+        f.evidence.iter().any(|e| e.text.contains(text))
+    }
+
+    fn memcpy_len_from(producer: &str) -> Vec<Finding> {
+        let b = bin(crate::arch::Arch::Arm, &[]);
+        let sites = vec![
+            at(producer, 0x1000, vec![]),
+            at("memcpy", 0x1010, vec![None, None, Some(Val::Ret(0))]),
+        ];
+        scan(&b, sites, "memcpy")
+    }
+
+    #[test]
+    fn breakdown_adds_up_to_score() {
+        let b = bin(crate::arch::Arch::Aarch64, &["system", "recv"]);
+        let mut strings = HashMap::new();
+        strings.insert(
+            0u64,
+            vec!["ping -c 1 %s".to_string(), "/tmp/x.sock".to_string()],
+        );
+        let sites = vec![
+            at("recv", 0x1000, vec![]),
+            at("system", 0x1010, vec![None]),
+            at("bind", 0x1020, vec![]),
+            at(
+                "memcpy",
+                0x1030,
+                vec![Some(Val::Stack(-0x40)), None, Some(Val::Ret(0))],
+            ),
+        ];
+        let findings = analyze(&b, &graph(sites, strings));
+        let calls: HashSet<&str> = findings.iter().map(|f| f.risky_call.as_str()).collect();
+        assert_eq!(calls, HashSet::from(["system", "bind", "memcpy"]));
+        for f in &findings {
+            let sum: i32 = f.evidence.iter().map(|e| e.points).sum();
+            assert_eq!(
+                sum,
+                f.score,
+                "{} {:?}",
+                f.risky_call,
+                f.evidence.iter().map(|e| &e.text).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn heap_memcpy_sized_by_recv_is_reported() {
+        let f = memcpy_len_from("recv");
+        assert!(says(&f[0], "raw return of recv()"));
+    }
+
+    #[test]
+    fn heap_memcpy_with_opaque_length_stays_silent() {
+        let b = bin(crate::arch::Arch::Arm, &[]);
+        assert!(scan(
+            &b,
+            vec![at("memcpy", 0x1010, vec![None, None, None])],
+            "memcpy"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn provenance_splits_sibling_sinks() {
+        let b = bin(crate::arch::Arch::Arm, &[]);
+        let sites = vec![
+            at("recv", 0x1000, vec![]),
+            at("strnlen", 0x1004, vec![]),
+            at(
+                "memcpy",
+                0x1008,
+                vec![Some(Val::Stack(-0x40)), None, Some(Val::Ret(0))],
+            ),
+            at(
+                "memcpy",
+                0x100c,
+                vec![Some(Val::Stack(-0x40)), None, Some(Val::Ret(1))],
+            ),
+        ];
+        let f = scan(&b, sites, "memcpy");
+        let score = |site| f.iter().find(|f| f.site == site).unwrap().score;
+        assert_eq!(score(0x1008) - score(0x100c), 35);
+    }
+
+    #[test]
+    fn snprintf_return_as_length_is_up_ranked() {
+        let b = bin(crate::arch::Arch::Arm, &[]);
+        let sites = vec![
+            at("snprintf", 0x1000, vec![]),
+            at(
+                "memcpy",
+                0x1010,
+                vec![Some(Val::Stack(-0x40)), None, Some(Val::Ret(0))],
+            ),
+        ];
+        assert!(says(&scan(&b, sites, "memcpy")[0], "untruncated length"));
+    }
+
+    #[test]
+    fn local_clamp_bounds_the_length() {
+        let b = bin(crate::arch::Arch::Arm, &[]);
+        let mut clamp = at("x", 0x1000, vec![]);
+        clamp.import = None;
+        clamp.target = 0x4000;
+        let sites = vec![
+            clamp,
+            at(
+                "memcpy",
+                0x1010,
+                vec![Some(Val::Stack(-0x40)), None, Some(Val::Ret(0))],
+            ),
+        ];
+        let mut g = graph(sites, HashMap::new());
+        g.names.insert(0x4000, "len_clamp".into());
+        let f: Vec<Finding> = analyze(&b, &g)
+            .into_iter()
+            .filter(|f| f.risky_call == "memcpy")
+            .collect();
+        assert!(says(&f[0], "bounded by len_clamp()"));
+    }
+
+    #[test]
+    fn watchdog_setoptions_uses_arch_encoding() {
+        let arm = bin(crate::arch::Arch::Arm, &[]);
+        let mips = bin(crate::arch::Arch::Mips, &[]);
+        let ioctl = |req| vec![at("ioctl", 0x1000, vec![None, Some(Val::Num(req)), None])];
+        assert_eq!(scan(&arm, ioctl(0x8004_5704), "ioctl")[0].class, Class::Wdt);
+        assert_eq!(
+            scan(&mips, ioctl(0x4004_5704), "ioctl")[0].class,
+            Class::Wdt
+        );
+        assert!(scan(&arm, ioctl(0x4004_5704), "ioctl").is_empty());
+        assert!(scan(&arm, ioctl(0x5401), "ioctl").is_empty());
+    }
+
+    #[test]
+    fn watchdog_magic_close() {
+        let mut b = bin(crate::arch::Arch::Arm, &[]);
+        b.data = b"V\0V?\0".to_vec();
+        b.segs = vec![crate::load::Seg {
+            vaddr: 0x2000,
+            off: 0,
+            filesz: 5,
+            exec: false,
+        }];
+        let write = |buf| {
+            vec![at(
+                "write",
+                0x1000,
+                vec![None, Some(Val::Num(buf)), Some(Val::Num(1))],
+            )]
+        };
+        assert_eq!(scan(&b, write(0x2000), "write")[0].class, Class::Wdt);
+        assert!(scan(&b, write(0x2002), "write").is_empty());
     }
 }

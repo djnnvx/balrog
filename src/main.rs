@@ -163,7 +163,8 @@ fn dedup_templates(findings: &mut Vec<rules::Finding>) {
         let Some(template) = finding
             .evidence
             .iter()
-            .find(|line| line.starts_with("format ") || line.starts_with("command template"))
+            .map(|line| &line.text)
+            .find(|text| text.starts_with("format ") || text.starts_with("command template"))
             .cloned()
         else {
             return true;
@@ -215,7 +216,10 @@ fn print_finding(out: &mut impl Write, finding: &rules::Finding) -> io::Result<(
         finding.score, finding.risky_call, finding.bin, finding.site, finding.func
     )?;
     for line in &finding.evidence {
-        writeln!(out, "       - {line}")?;
+        match line.points {
+            0 => writeln!(out, "       - {}", line.text)?,
+            p => writeln!(out, "       - ({p:+}) {}", line.text)?,
+        }
     }
     Ok(())
 }
