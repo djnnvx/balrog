@@ -35,3 +35,16 @@ balrog scan --top 30 <p>       cap findings shown per class (default 15)
 balrog imports <file>          resolved imports and their stub addresses
 ```
 
+
+Classes: `exec ipc tls fmt mem auth priv path wdt`.
+
+Each finding lists how its score was built:
+
+```
+[ 90] memcpy  poc+0xac8  heap
+       - (+35) mem base 35, rule +0
+       - (+15) arg 2 is the raw return of recv()
+       - (+40) same function as a network/env input
+```
+
+In `-j` output, `evidence` is a list of `{points, text}`.
