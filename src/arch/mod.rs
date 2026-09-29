@@ -161,7 +161,7 @@ fn operands(ops: &[ArchOperand]) -> [Op; 3] {
             _ => Op::None,
         },
         Some(ArchOperand::Arm64Operand(o)) => match o.op_type {
-            Arm64OperandType::Reg(r) => Op::Reg(r.0),
+            Arm64OperandType::Reg(r) => Op::Reg(aarch64::wide(r.0)),
             Arm64OperandType::Imm(v) => match o.shift {
                 Arm64Shift::Lsl(n) => Op::Imm(v << n),
                 _ => Op::Imm(v),
@@ -327,7 +327,10 @@ mod tests {
     fn aarch64_mov_imm_recovers_const() {
         let k = decode_one(Arch::Aarch64, &[0xe1, 0xff, 0x9f, 0x52], 0, "mov");
         match k {
-            Kind::SetConst { val, .. } => assert_eq!(val, 0xffff),
+            Kind::SetConst { dst, val } => {
+                assert_eq!(dst, aarch64::ARG_REGS[1], "w1 must alias x1");
+                assert_eq!(val, 0xffff)
+            }
             other => panic!("got {other:?}"),
         }
     }
