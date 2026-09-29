@@ -1880,6 +1880,10 @@ mod tests {
             .filter(|f| f.risky_call == "memcpy")
             .collect();
         assert!(says(&f[0], "bounded by len_clamp()"));
+        assert!(f[0]
+            .evidence
+            .iter()
+            .any(|e| e.text.contains("bounded by len_clamp") && e.points == -20));
     }
 
     #[test]
@@ -1915,5 +1919,18 @@ mod tests {
         };
         assert_eq!(scan(&b, write(0x2000), "write")[0].class, Class::Wdt);
         assert!(scan(&b, write(0x2002), "write").is_empty());
+    }
+
+    #[test]
+    fn watchdog_settimeout_flagged_on_all_arches_and_note_only_sums() {
+        let ioctl = |req| vec![at("ioctl", 0x1000, vec![None, Some(Val::Num(req)), None])];
+        for arch in [crate::arch::Arch::Arm, crate::arch::Arch::Mips] {
+            let b = bin(arch, &[]);
+            let f = &scan(&b, ioctl(0xc004_5706), "ioctl")[0];
+            assert_eq!(f.class, Class::Wdt);
+            assert!(says(f, "SETTIMEOUT"));
+            let sum: i32 = f.evidence.iter().map(|e| e.points).sum();
+            assert_eq!(sum, f.score);
+        }
     }
 }

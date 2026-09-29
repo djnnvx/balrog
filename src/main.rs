@@ -312,3 +312,45 @@ fn main() -> Result<()> {
         Cmd::Imports { path } => run_imports(&path),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rules::{Class, Evidence, Finding};
+
+    fn templated(call: &str, template: &str) -> Finding {
+        Finding {
+            bin: "b".into(),
+            class: Class::Exec,
+            risky_call: call.into(),
+            site: 0x10,
+            func: "f".into(),
+            reach: None,
+            evidence: vec![Evidence {
+                points: 0,
+                text: format!("command template {template:?}"),
+            }],
+            score: 100,
+        }
+    }
+
+    #[test]
+    fn dedup_collapses_identical_templates_keeps_distinct() {
+        let mut v = vec![
+            templated("system", "%s"),
+            templated("system", "%s"),
+            templated("system", "%d"),
+        ];
+        dedup_templates(&mut v);
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn dedup_keeps_findings_without_a_template() {
+        let mut v = vec![templated("system", "%s"), templated("system", "%s")];
+        v[0].evidence.clear();
+        v[1].evidence.clear();
+        dedup_templates(&mut v);
+        assert_eq!(v.len(), 2);
+    }
+}

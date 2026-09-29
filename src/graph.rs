@@ -246,9 +246,7 @@ impl Graph {
                     regs.clobber_args();
                     regs.returned(pushed);
                 }
-                // A return ends the frame. Reset here so a callee-saved value
-                // (notably Val::Ret) cannot bleed into a following function that
-                // was not detected as a start and so never triggers enter().
+                // enter() only resets at detected function starts; a return is the other frame boundary.
                 Kind::Ret => regs.enter(),
                 _ => {}
             }
@@ -339,9 +337,6 @@ mod tests {
         }
     }
 
-    // Func A (start 0) calls recv, returns, then an UNDETECTED func at 0x8 calls
-    // memcpy with the value in x0. Without the ret reset, x0=Ret(recv) bleeds
-    // across and memcpy's arg is tagged as recv's return.
     fn stream() -> (Vec<Ins>, HashMap<u64, String>) {
         let x0 = arg_reg(Arch::Aarch64, 0).unwrap();
         let x2 = arg_reg(Arch::Aarch64, 2).unwrap();
@@ -349,7 +344,7 @@ mod tests {
             Ins {
                 addr: 0x0,
                 kind: Kind::Call(0x100),
-            }, // recv -> x0 = Ret
+            },
             Ins {
                 addr: 0x4,
                 kind: Kind::Ret,
@@ -361,7 +356,7 @@ mod tests {
             Ins {
                 addr: 0xc,
                 kind: Kind::Call(0x200),
-            }, // memcpy(_, _, x2)
+            },
         ];
         let stubs = HashMap::from([(0x100, "recv".to_string()), (0x200, "memcpy".to_string())]);
         (insns, stubs)
@@ -381,5 +376,33 @@ mod tests {
             Some(&None),
             "recv return leaked across ret into memcpy"
         );
+    }
+
+    #[test]
+    fn call_return_flows_to_next_sink() {
+        let x0 = arg_reg(Arch::Aarch64, 0).unwrap();
+        let x2 = arg_reg(Arch::Aarch64, 2).unwrap();
+        let insns = vec![
+            Ins {
+                addr: 0x0,
+                kind: Kind::Call(0x100),
+            },
+            Ins {
+                addr: 0x4,
+                kind: Kind::Mov { dst: x2, src: x0 },
+            },
+            Ins {
+                addr: 0x8,
+                kind: Kind::Call(0x200),
+            },
+        ];
+        let stubs = HashMap::from([(0x100, "recv".to_string()), (0x200, "memcpy".to_string())]);
+        let g = Graph::build(&empty_bin(), &insns, stubs);
+        let memcpy = g
+            .sites
+            .iter()
+            .find(|s| s.import.as_deref() == Some("memcpy"))
+            .unwrap();
+        assert_eq!(memcpy.args.get(2), Some(&Some(Val::Ret(0))));
     }
 }

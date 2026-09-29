@@ -363,4 +363,71 @@ mod tests {
             other => panic!("got {other:?}"),
         }
     }
+
+    #[test]
+    fn aarch64_movk_merges_into_dst() {
+        let k = decode_one(Arch::Aarch64, &[0x81, 0x00, 0xb0, 0xf2], 0, "movk");
+        match k {
+            Kind::AddImm { dst, base, imm } => {
+                assert_eq!(dst, aarch64::ARG_REGS[1]);
+                assert_eq!(base, aarch64::ARG_REGS[1]);
+                assert_eq!(imm, 0x8004 << 16);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aarch64_sxtw_is_mov() {
+        let k = decode_one(Arch::Aarch64, &[0x02, 0x7c, 0x40, 0x93], 0, "sxtw");
+        match k {
+            Kind::Mov { dst, src } => {
+                assert_eq!(dst, aarch64::ARG_REGS[2]);
+                assert_eq!(src, aarch64::ARG_REGS[0]);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mips_ret_reg_is_v0_others_are_arg0() {
+        assert_eq!(ret_reg(Arch::Mips), Some(mips::V0));
+        assert_eq!(ret_reg(Arch::Arm), arg_reg(Arch::Arm, 0));
+        assert_eq!(ret_reg(Arch::Aarch64), arg_reg(Arch::Aarch64, 0));
+    }
+
+    #[test]
+    fn wide_aliases_endpoints_and_fp_lr() {
+        use capstone::arch::arm64::Arm64Reg;
+        let w = |r| aarch64::wide(r as u16);
+        assert_eq!(w(Arm64Reg::ARM64_REG_W0), Arm64Reg::ARM64_REG_X0 as u16);
+        assert_eq!(w(Arm64Reg::ARM64_REG_W28), Arm64Reg::ARM64_REG_X28 as u16);
+        assert_eq!(w(Arm64Reg::ARM64_REG_W29), Arm64Reg::ARM64_REG_X29 as u16);
+        assert_eq!(w(Arm64Reg::ARM64_REG_W30), Arm64Reg::ARM64_REG_X30 as u16);
+    }
+
+    #[test]
+    fn sweep_stitches_across_chunk_boundary() {
+        let n = 9000usize;
+        let mut bin = dummy(Arch::Aarch64, true);
+        bin.data = std::iter::repeat_n([0x1f, 0x20, 0x03, 0xd5], n)
+            .flatten()
+            .collect();
+        bin.segs = vec![crate::load::Seg {
+            vaddr: 0x1000,
+            off: 0,
+            filesz: (n * 4) as u64,
+            exec: true,
+        }];
+        let cs = build(Arch::Aarch64, true).unwrap();
+        let out = sweep(&cs, &bin);
+        assert_eq!(
+            out.len(),
+            n,
+            "chunk stitching dropped or duplicated instructions"
+        );
+        for (i, ins) in out.iter().enumerate() {
+            assert_eq!(ins.addr, 0x1000 + (i as u64) * 4);
+        }
+    }
 }
