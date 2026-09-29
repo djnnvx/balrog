@@ -100,6 +100,8 @@ pub fn build(arch: Arch, little: bool) -> Result<Capstone> {
     Ok(cs)
 }
 
+const SWEEP_CHUNK: usize = 8192;
+
 pub fn sweep(cs: &Capstone, bin: &Binary) -> Vec<Ins> {
     let align = bin.arch.align();
     let mut out = Vec::new();
