@@ -331,6 +331,7 @@ mod tests {
                 text: format!("command template {template:?}"),
             }],
             score: 100,
+            shell_injection: false,
         }
     }
 

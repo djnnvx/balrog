@@ -430,6 +430,8 @@ const VERIFY_OFF_BONUS: i32 = 30;
 const FORTIFY_OFF_BONUS: i32 = 40;
 const FORTIFY_OFF_NOTE: &str = "FORTIFY bound is -1: the size check is disabled";
 const SHELL_TEMPLATE_BONUS: i32 = 25;
+const SHELL_INJECTION_BONUS: i32 = 20;
+const SHELL_META: &[&str] = &[">", "|", ";", "`", "$("];
 const DIGEST_LENGTHS: &[u64] = &[16, 20, 32, 48, 64];
 const MAX_TEMPLATES: usize = 3;
 const MAX_SOCKET_PATHS: usize = 2;
@@ -509,6 +511,8 @@ pub struct Finding {
     pub reach: Option<u32>,
     pub evidence: Vec<Evidence>,
     pub score: i32,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub shell_injection: bool,
 }
 
 #[derive(Serialize)]
@@ -596,6 +600,11 @@ fn unbounded_scan(fmt: &str) -> bool {
     false
 }
 
+// unquoted %s plus a metacharacter only a shell interprets => injection, not an inert arg
+fn shell_injection(t: &str) -> bool {
+    unbounded_scan(t) && SHELL_META.iter().any(|m| t.contains(m))
+}
+
 fn mode_note(m: u64) -> Option<String> {
     if m & 0o4000 != 0 {
         Some(format!("setuid bit in mode {m:#o}"))
@@ -612,6 +621,7 @@ struct Hit {
     class: Class,
     score: i32,
     evidence: Vec<Evidence>,
+    shell_injection: bool,
 }
 
 impl Hit {
@@ -622,6 +632,7 @@ impl Hit {
             class,
             score,
             evidence: vec![Evidence::new(score, why)],
+            shell_injection: false,
         }
     }
     fn note(&mut self, ev: impl Into<String>) {
@@ -811,7 +822,16 @@ fn shell(s: &Site) -> Option<Hit> {
         ));
     }
     match s.text(cmd_arg) {
-        Some(t) if t.contains('%') => h.bump(25, format!("command template {t:?}")),
+        Some(t) if t.contains('%') => {
+            h.bump(25, format!("command template {t:?}"));
+            if shell_injection(&t) {
+                h.shell_injection = true;
+                h.bump(
+                    SHELL_INJECTION_BONUS,
+                    "shell injection: unquoted %s with a shell metacharacter",
+                );
+            }
+        }
         Some(t) => h.bump(-30, format!("constant command {t:?}")),
         None if s.num(cmd_arg).is_some() => {
             h.bump(-10, "argument is a constant that is not readable text")
@@ -1426,6 +1446,7 @@ pub fn analyze(bin: &Binary, graph: &Graph) -> Vec<Finding> {
             reach: s.reach,
             evidence: h.evidence,
             score: h.score,
+            shell_injection: h.shell_injection,
         });
     }
     out.extend(absences(&scan));
@@ -1537,6 +1558,7 @@ fn absences(sc: &Scan) -> Vec<Finding> {
                 .map(|(i, e)| Evidence::new(if i == 0 { score } else { 0 }, *e))
                 .collect(),
             score,
+            shell_injection: false,
         })
     };
 
@@ -1621,6 +1643,14 @@ mod tests {
     fn looks_shell_ignores_benign_formats() {
         assert!(!looks_shell("value=%d"));
         assert!(!looks_shell("hello"));
+    }
+
+    #[test]
+    fn shell_injection_flags_redirect_and_pipe() {
+        assert!(shell_injection("ping %s -s 56 -c 3 >%s"));
+        assert!(shell_injection("echo %s | sh"));
+        assert!(!shell_injection("value=%d")); // no %s
+        assert!(!shell_injection("cp %s /tmp")); // %s but no proving metachar
     }
 
     #[test]
