@@ -431,7 +431,7 @@ const FORTIFY_OFF_BONUS: i32 = 40;
 const FORTIFY_OFF_NOTE: &str = "FORTIFY bound is -1: the size check is disabled";
 const SHELL_TEMPLATE_BONUS: i32 = 25;
 const SHELL_INJECTION_BONUS: i32 = 20;
-const SHELL_META: &[&str] = &[">", "|", ";", "`", "$("];
+const SHELL_META: &[&str] = &[">", "|", ";", "`", "$(", "&"];
 const DIGEST_LENGTHS: &[u64] = &[16, 20, 32, 48, 64];
 const MAX_TEMPLATES: usize = 3;
 const MAX_SOCKET_PATHS: usize = 2;
@@ -824,7 +824,8 @@ fn shell(s: &Site) -> Option<Hit> {
     match s.text(cmd_arg) {
         Some(t) if t.contains('%') => {
             h.bump(25, format!("command template {t:?}"));
-            if shell_injection(&t) {
+            let shell_call = ["system", "popen", "wordexp"].contains(&s.imp);
+            if shell_injection(&t) || (shell_call && unbounded_scan(&t)) {
                 h.shell_injection = true;
                 h.bump(
                     SHELL_INJECTION_BONUS,
@@ -1651,6 +1652,21 @@ mod tests {
         assert!(shell_injection("echo %s | sh"));
         assert!(!shell_injection("value=%d")); // no %s
         assert!(!shell_injection("cp %s /tmp")); // %s but no proving metachar
+    }
+
+    #[test]
+    fn system_with_unquoted_s_flags_injection_without_metachar() {
+        let mut b = bin(crate::arch::Arch::Aarch64, &[]);
+        b.data = b"ping %s\0".to_vec();
+        b.segs = vec![crate::load::Seg {
+            vaddr: 0x2000,
+            off: 0,
+            filesz: b.data.len() as u64,
+            exec: false,
+        }];
+        let g = graph(vec![site("system", vec![Some(Val::Num(0x2000))])], HashMap::new());
+        let f = analyze(&b, &g);
+        assert!(f.iter().any(|f| f.risky_call == "system" && f.shell_injection));
     }
 
     #[test]
